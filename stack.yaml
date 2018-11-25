@@ -1,0 +1,228 @@
+---
+AWSTemplateFormatVersion : '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Simple API gateway  and stepfunctions integration example
+
+
+Resources:
+
+  PublicApi:
+    Type: AWS::Serverless::Api
+    Properties:
+        StageName: prod
+        DefinitionBody:
+            swagger: 2.0
+            info:
+              title:
+                Ref: AWS::StackName
+            paths:
+              /sfnonly: # api gateway invokes step function asynchronously
+                get:
+                  produces:
+                  - "application/json"
+                  responses:
+                    "200":
+                      description: "200 response"
+                      schema:
+                        $ref: "#/definitions/Empty"
+                      headers:
+                         Access-Control-Allow-Headers:
+                          type: "string"
+
+                  security: []
+                  x-amazon-apigateway-integration:
+                    responses:
+                      default:
+                        statusCode: "200"
+                        headers:
+                         Access-Control-Allow-Headers:
+                          type: "'*'"
+                    passthroughBehavior: "when_no_match"
+                    httpMethod: "POST"
+                    type: "aws"
+                    credentials: !GetAtt APIGatewayRole.Arn
+                    uri: "arn:aws:apigateway:us-east-1:states:action/StartExecution"
+                    requestTemplates:
+                      application/json:
+                        !Sub
+                          |-
+                            {
+                              "input": "$util.escapeJavaScript($input.json('$'))",
+                              "stateMachineArn": "${StateMachine}"
+                            }
+
+              /lambda2sfn: # api gateway invokes lambda synchronously, which in turn invokes the stepfunction and waits for its final result
+                get:
+                  produces:
+                  - "application/json"
+                  responses:
+                    "200":
+                      description: "200 response"
+                      schema:
+                        $ref: "#/definitions/Empty"
+                      headers:
+                         Access-Control-Allow-Headers:
+                          type: "string"
+
+                  security: []
+                  x-amazon-apigateway-integration:
+                    responses:
+                      default:
+                        statusCode: "200"
+                        headers:
+                         Access-Control-Allow-Headers:
+                          type: "'*'"
+                    httpMethod: POST
+                    type: aws_proxy
+                    uri:
+                      Fn::Sub: arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HelloWorldExecutor.Arn}/invocations
+
+            definitions:
+              Empty:
+                type: "object"
+                title: "Empty Schema"
+
+  # Role which allows API Gateway to execute step functions and log to cloud watch
+  APIGatewayRole: 
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: Allow
+            Principal: 
+              Service: 
+                - "apigateway.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns: 
+        - "arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs"
+        - "arn:aws:iam::aws:policy/AWSStepFunctionsFullAccess"
+  
+  # Assiging the role to api gateway, not necessary if we don't want apu gateway to log to cloud watch
+  Account: 
+    Type: AWS::ApiGateway::Account
+    Properties: 
+      CloudWatchRoleArn: !GetAtt APIGatewayRole.Arn
+
+  # Defining our awesome fan out state machine using stepfunctions
+  StateMachine:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      DefinitionString:
+        !Sub
+          - |-
+            {
+              "Comment": "A Hello World example",
+              "StartAt": "HelloWorld",
+              "States": {
+                "HelloWorld": {
+                  "Type": "Task",
+                  "Resource": "${lambdaArn}",
+                  "Next": "Fanout"
+                },
+                "Fanout": {
+                  "Type": "Parallel",
+                  "End": true,
+                  "Branches": [
+                    {
+                      "StartAt": "task1",
+                      "States": {
+                        "task1": {
+                          "Type": "Task",
+                          "Resource": "${lambdaArn}",
+                          "End": true
+                        }
+                      }
+                    },
+                    {
+                      "StartAt": "task2",
+                      "States": {
+                        "task2": {
+                          "Type": "Task",
+                          "Resource": "${lambdaArn}",
+                          "End": true
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          - {lambdaArn: !GetAtt [ HelloWorldLambda, Arn ]}
+      RoleArn: !GetAtt [ StatesExecutionRole, Arn ]
+
+  # Role which allows step functions to invoke lambad functions
+  StatesExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - !Sub states.${AWS::Region}.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource: "*"
+
+  # some lambda function which returns a string
+  HelloWorldLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: hello_world.handler
+      Runtime: python2.7
+      CodeUri: ./src
+      Timeout: 300
+      Environment:
+        Variables:
+          LOGGING_LEVEL: Dev
+          DEPLOYMENT_TYPE: Dev
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - 
+              Effect: "Allow"
+              Action: 
+                - s3:PutObject
+                - s3:GetObject
+                - s3:DeleteObject
+              Resource: "*"
+
+  # lambda function which invokes a step function and returns its result
+  HelloWorldExecutor:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: hello_world_executor.handler
+      Runtime: python2.7
+      CodeUri: ./src
+      Timeout: 300
+      Environment:
+        Variables:
+          LOGGING_LEVEL: Dev
+          DEPLOYMENT_TYPE: Dev
+          STEP_FUNCTION_ARN: !Ref StateMachine
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - 
+              Effect: "Allow" # step function permissions open for now
+              Action: 
+                - states:*
+              Resource: "*"
+      Events:
+        ExecSFNResource:
+          Type: Api
+          Properties:
+            RestApiId: !Ref PublicApi
+            Path: /lambda2sfn
+            Method: get
